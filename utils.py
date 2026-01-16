@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchvision.utils as vutils
 
-from data import ImageDataset, ImageDataset_2D, ImageDataset_3D
+from data import ImageDataset, ImageDataset_2D, ImageDataset_3D, SWCSkeletonDataset, TIFFDataset
 
 
 def get_config(config):
@@ -34,6 +34,12 @@ def get_data_loader(data, img_path, img_dim, img_slice,
     
     if data == 'phantom':
         dataset = ImageDataset(img_path, img_dim)
+    elif data == 'tiff' or img_path.endswith('.tif') or img_path.endswith('.tiff'):
+        # TIFF microscopy image dataset
+        dataset = TIFFDataset(img_path, img_dim)
+    elif data == 'swc' or img_path.endswith('.swc'):
+        # SWC skeleton-based dataset (rasterized)
+        dataset = SWCSkeletonDataset(img_path, img_dim)
     elif '3d' in data:
         dataset = ImageDataset_3D(img_path, img_dim)
     else:
@@ -49,11 +55,16 @@ def get_data_loader(data, img_path, img_dim, img_slice,
 
 def save_image_3d(tensor, slice_idx, file_name):
     '''
-    tensor: [bs, c, h, w, 1]
+    tensor: [bs, D, H, W, 1]
+    Saves slices in a 2-row grid for better visualization
     '''
+    import math
     image_num = len(slice_idx)
-    tensor = tensor[0, slice_idx, ...].permute(0, 3, 1, 2).cpu().data  # [c, 1, h, w]
-    image_grid = vutils.make_grid(tensor, nrow=image_num, padding=0, normalize=True, scale_each=True)
+    tensor = tensor[0, slice_idx, ...].permute(0, 3, 1, 2).cpu().data  # [num_slices, 1, H, W]
+    
+    # Use 2 rows for better layout with high resolution images
+    nrow = math.ceil(image_num / 2)
+    image_grid = vutils.make_grid(tensor, nrow=nrow, padding=2, normalize=True, scale_each=True)
     vutils.save_image(image_grid, file_name, nrow=1)
 
 
@@ -91,28 +102,28 @@ def map_coordinates(input, coordinates):
 
 
 def ct_parallel_project_2d(img, theta):
-	bs, h, w, c = img.size()
+    bs, h, w, c = img.size()
 
-	# (y, x)=(i, j): [0, w] -> [-0.5, 0.5]
-	y, x = torch.meshgrid([torch.arange(h, dtype=torch.float32) / h - 0.5,
-							torch.arange(w, dtype=torch.float32) / w - 0.5])
+    # (y, x)=(i, j): [0, w] -> [-0.5, 0.5]
+    y, x = torch.meshgrid([torch.arange(h, dtype=torch.float32) / h - 0.5,
+                            torch.arange(w, dtype=torch.float32) / w - 0.5])
 
-	# Rotation transform matrix: simulate parallel projection rays
-	x_rot = x * torch.cos(theta) - y * torch.sin(theta)
-	y_rot = x * torch.sin(theta) + y * torch.cos(theta)
+    # Rotation transform matrix: simulate parallel projection rays
+    x_rot = x * torch.cos(theta) - y * torch.sin(theta)
+    y_rot = x * torch.sin(theta) + y * torch.cos(theta)
 
-	# Reverse back to index [0, w]
-	x_rot = (x_rot + 0.5) * w
-	y_rot = (y_rot + 0.5) * h
+    # Reverse back to index [0, w]
+    x_rot = (x_rot + 0.5) * w
+    y_rot = (y_rot + 0.5) * h
 
-	# Resample (x, y) index of the pixel on the projection ray-theta
-	sample_coords = torch.stack([y_rot, x_rot], dim=0).cuda()  # [2, h, w]
-	img_resampled = map_coordinates(img, sample_coords) # [b, h, w, c]
+    # Resample (x, y) index of the pixel on the projection ray-theta
+    sample_coords = torch.stack([y_rot, x_rot], dim=0).cuda()  # [2, h, w]
+    img_resampled = map_coordinates(img, sample_coords) # [b, h, w, c]
 
-	# Compute integral projections along rays
-	proj = torch.mean(img_resampled, dim=1, keepdim=True) # [b, 1, w, c]
+    # Compute integral projections along rays
+    proj = torch.mean(img_resampled, dim=1, keepdim=True) # [b, 1, w, c]
 
-	return proj
+    return proj
 
 
 def ct_parallel_project_2d_batch(img, thetas):
@@ -122,8 +133,8 @@ def ct_parallel_project_2d_batch(img, thetas):
     '''
     projs = []
     for theta in thetas:
-    	proj = ct_parallel_project_2d(img, theta)
-    	projs.append(proj)
+        proj = ct_parallel_project_2d(img, theta)
+        projs.append(proj)
     projs = torch.cat(projs, dim=1)  # [b, num, w, c]
 
     return projs

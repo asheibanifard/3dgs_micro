@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Volume Renderer - Gaussian Neuron</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #000;
+            overflow: hidden;
+        }
+        #canvas { width: 100vw; height: 100vh; display: block; }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 10px;
+            font-size: 14px;
+            max-width: 280px;
+        }
+        #info h1 { font-size: 16px; margin-bottom: 10px; color: #fff; }
+        #info p { margin: 5px 0; color: #aaa; font-size: 12px; }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 10px;
+        }
+        #controls label { display: block; margin: 8px 0 3px; color: #aaa; font-size: 12px; }
+        #controls input[type="range"] { width: 180px; }
+        #controls button {
+            margin: 5px 5px 5px 0;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            background: #444;
+            color: #fff;
+            font-size: 12px;
+        }
+        #controls button:hover { background: #666; }
+        #controls button.active { background: #0af; }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff;
+            font-size: 18px;
+        }
+        .val { color: #0af; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading volume data...</div>
+    <canvas id="canvas"></canvas>
+    <div id="info" style="display:none;">
+        <h1>🧠 Volume Ray-Casting Renderer</h1>
+        <p>Volume: <span class="val">100 × 650 × 820</span></p>
+        <p>FPS: <span class="val" id="fps">-</span></p>
+        <p style="margin-top: 10px;">🖱️ Drag to rotate | Scroll to zoom</p>
+    </div>
+    <div id="controls" style="display:none;">
+        <label>Brightness: <span id="brightnessVal">1.0</span></label>
+        <input type="range" id="brightness" min="0.1" max="3" step="0.1" value="1">
+        
+        <label>Threshold: <span id="thresholdVal">0.05</span></label>
+        <input type="range" id="threshold" min="0" max="0.5" step="0.01" value="0.05">
+        
+        <label>Steps: <span id="stepsVal">256</span></label>
+        <input type="range" id="steps" min="64" max="512" step="32" value="256">
+        
+        <label>Render Mode</label>
+        <button id="mipBtn" class="active">MIP</button>
+        <button id="alphaBtn">Alpha</button>
+        <button id="isoBtn">Isosurface</button>
+        
+        <label>Auto-Rotate</label>
+        <button id="rotateBtn" class="active">On</button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const gl = canvas.getContext('webgl2');
+        
+        if (!gl) {
+            alert('WebGL2 not supported');
+        }
+
+        let volumeTexture;
+        let program;
+        let vao;
+        let rotationX = 0.3;
+        let rotationY = 0;
+        let zoom = 2.0;
+        let autoRotate = true;
+        let renderMode = 0; // 0=MIP, 1=Alpha, 2=Iso
+        let brightness = 1.0;
+        let threshold = 0.05;
+        let numSteps = 256;
+        let volumeDims = {x: 128, y: 101, z: 16};
+        let aspectRatio = {x: 1.0, y: 0.793, z: 0.122};
+        let lastTime = performance.now();
+        let frameCount = 0;
+        let fps = 0;
+
+        // Vertex shader
+        const vsSource = `#version 300 es
+        in vec3 aPosition;
+        out vec3 vPosition;
+        void main() {
+            vPosition = aPosition;
+            gl_Position = vec4(aPosition.xy, 0.0, 1.0);
+        }`;
+
+        // Fragment shader - ray casting
+        const fsSource = `#version 300 es
+        precision highp float;
+        precision highp sampler3D;
+        
+        in vec3 vPosition;
+        out vec4 fragColor;
+        
+        uniform sampler3D uVolume;
+        uniform vec3 uVolumeDims;
+        uniform vec3 uAspectRatio;
+        uniform mat4 uRotation;
+        uniform float uZoom;
+        uniform float uBrightness;
+        uniform float uThreshold;
+        uniform int uRenderMode;
+        uniform int uNumSteps;
+        
+        vec2 intersectBox(vec3 orig, vec3 dir, vec3 boxSize) {
+            vec3 boxMin = -boxSize;
+            vec3 boxMax = boxSize;
+            vec3 invDir = 1.0 / dir;
+            vec3 tmin = (boxMin - orig) * invDir;
+            vec3 tmax = (boxMax - orig) * invDir;
+            vec3 t1 = min(tmin, tmax);
+            vec3 t2 = max(tmin, tmax);
+            float tNear = max(max(t1.x, t1.y), t1.z);
+            float tFar = min(min(t2.x, t2.y), t2.z);
+            return vec2(tNear, tFar);
+        }
+        
+        float sampleVolume(vec3 pos, vec3 boxSize) {
+            // Convert world position to texture coordinates
+            vec3 texCoord = (pos / boxSize) * 0.5 + 0.5;
+            if (texCoord.x < 0.0 || texCoord.x > 1.0 ||
+                texCoord.y < 0.0 || texCoord.y > 1.0 ||
+                texCoord.z < 0.0 || texCoord.z > 1.0) {
+                return 0.0;
+            }
+            return texture(uVolume, texCoord).r;
+        }
+        
+        void main() {
+            // Box size based on real aspect ratio
+            vec3 boxSize = uAspectRatio;
+            
+            vec3 rayDir = normalize(vec3(vPosition.xy / uZoom, -1.0));
+            vec3 rayOrig = vec3(vPosition.xy / uZoom * 2.0, 3.0);
+            
+            // Apply rotation
+            rayDir = (uRotation * vec4(rayDir, 0.0)).xyz;
+            rayOrig = (uRotation * vec4(rayOrig, 1.0)).xyz;
+            
+            vec2 tHit = intersectBox(rayOrig, rayDir, boxSize);
+            if (tHit.x > tHit.y) {
+                fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                return;
+            }
+            
+            tHit.x = max(tHit.x, 0.0);
+            
+            float stepSize = (tHit.y - tHit.x) / float(uNumSteps);
+            vec3 pos = rayOrig + rayDir * tHit.x;
+            vec3 step = rayDir * stepSize;
+            
+            float maxVal = 0.0;
+            float accum = 0.0;
+            float alpha = 0.0;
+            vec3 isoPos = vec3(0.0);
+            bool foundIso = false;
+            
+            for (int i = 0; i < 512; i++) {
+                if (i >= uNumSteps) break;
+                
+                float val = sampleVolume(pos, boxSize);
+                
+                if (uRenderMode == 0) {
+                    // MIP
+                    maxVal = max(maxVal, val);
+                } else if (uRenderMode == 1) {
+                    // Alpha compositing
+                    float a = val * 0.1;
+                    accum += (1.0 - alpha) * val * a;
+                    alpha += (1.0 - alpha) * a;
+                    if (alpha > 0.99) break;
+                } else {
+                    // Isosurface
+                    if (!foundIso && val > uThreshold + 0.1) {
+                        isoPos = pos;
+                        foundIso = true;
+                        break;
+                    }
+                }
+                
+                pos += step;
+            }
+            
+            float result;
+            if (uRenderMode == 0) {
+                result = maxVal;
+            } else if (uRenderMode == 1) {
+                result = accum;
+            } else {
+                if (foundIso) {
+                    // Simple lighting
+                    float eps = 0.01;
+                    float gx = sampleVolume(isoPos + vec3(eps,0,0), boxSize) - sampleVolume(isoPos - vec3(eps,0,0), boxSize);
+                    float gy = sampleVolume(isoPos + vec3(0,eps,0), boxSize) - sampleVolume(isoPos - vec3(0,eps,0), boxSize);
+                    float gz = sampleVolume(isoPos + vec3(0,0,eps), boxSize) - sampleVolume(isoPos - vec3(0,0,eps), boxSize);
+                    vec3 normal = normalize(vec3(gx, gy, gz));
+                    vec3 lightDir = normalize(vec3(1, 1, 1));
+                    result = max(0.2, dot(normal, lightDir));
+                } else {
+                    result = 0.0;
+                }
+            }
+            
+            // Apply threshold and brightness
+            result = max(0.0, result - uThreshold) * uBrightness;
+            fragColor = vec4(vec3(result), 1.0);
+        }`;
+
+        function createShader(type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(vs, fs) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error(gl.getProgramInfoLog(program));
+                return null;
+            }
+            return program;
+        }
+
+        async function loadVolume() {
+            // Load dimensions
+            const dimsResp = await fetch('volume_dims.json');
+            const dims = await dimsResp.json();
+            volumeDims = {x: dims.x, y: dims.y, z: dims.z};
+            aspectRatio = {x: dims.aspect_x, y: dims.aspect_y, z: dims.aspect_z};
+            
+            console.log('Volume dims:', volumeDims);
+            console.log('Aspect ratio:', aspectRatio);
+            
+            // Load raw volume data
+            const resp = await fetch('volume.raw');
+            const buffer = await resp.arrayBuffer();
+            const data = new Uint8Array(buffer);
+            
+            // Create 3D texture
+            volumeTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_3D, volumeTexture);
+            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+            
+            gl.texImage3D(
+                gl.TEXTURE_3D, 0, gl.R8,
+                volumeDims.x, volumeDims.y, volumeDims.z,
+                0, gl.RED, gl.UNSIGNED_BYTE, data
+            );
+            
+            console.log(`Volume loaded: ${volumeDims.x}x${volumeDims.y}x${volumeDims.z}`);
+        }
+
+        function init() {
+            // Create shaders
+            const vs = createShader(gl.VERTEX_SHADER, vsSource);
+            const fs = createShader(gl.FRAGMENT_SHADER, fsSource);
+            program = createProgram(vs, fs);
+            
+            // Create fullscreen quad
+            const positions = new Float32Array([
+                -1, -1, 0,  1, -1, 0,  -1, 1, 0,
+                -1, 1, 0,  1, -1, 0,  1, 1, 0
+            ]);
+            
+            vao = gl.createVertexArray();
+            gl.bindVertexArray(vao);
+            
+            const posBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+            
+            const posLoc = gl.getAttribLocation(program, 'aPosition');
+            gl.enableVertexAttribArray(posLoc);
+            gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+        }
+
+        function makeRotationMatrix(rx, ry) {
+            const cx = Math.cos(rx), sx = Math.sin(rx);
+            const cy = Math.cos(ry), sy = Math.sin(ry);
+            return new Float32Array([
+                cy, 0, sy, 0,
+                sx*sy, cx, -sx*cy, 0,
+                -cx*sy, sx, cx*cy, 0,
+                0, 0, 0, 1
+            ]);
+        }
+
+        function render() {
+            // FPS calculation
+            frameCount++;
+            const now = performance.now();
+            if (now - lastTime >= 1000) {
+                fps = frameCount;
+                frameCount = 0;
+                lastTime = now;
+                document.getElementById('fps').textContent = fps;
+            }
+            
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            
+            if (autoRotate) {
+                rotationY += 0.005;
+            }
+            
+            gl.useProgram(program);
+            gl.bindVertexArray(vao);
+            
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_3D, volumeTexture);
+            gl.uniform1i(gl.getUniformLocation(program, 'uVolume'), 0);
+            
+            gl.uniform3f(gl.getUniformLocation(program, 'uVolumeDims'), 
+                volumeDims.x, volumeDims.y, volumeDims.z);
+            gl.uniform3f(gl.getUniformLocation(program, 'uAspectRatio'), 
+                aspectRatio.x, aspectRatio.y, aspectRatio.z);
+            gl.uniformMatrix4fv(gl.getUniformLocation(program, 'uRotation'), 
+                false, makeRotationMatrix(rotationX, rotationY));
+            gl.uniform1f(gl.getUniformLocation(program, 'uZoom'), zoom);
+            gl.uniform1f(gl.getUniformLocation(program, 'uBrightness'), brightness);
+            gl.uniform1f(gl.getUniformLocation(program, 'uThreshold'), threshold);
+            gl.uniform1i(gl.getUniformLocation(program, 'uRenderMode'), renderMode);
+            gl.uniform1i(gl.getUniformLocation(program, 'uNumSteps'), numSteps);
+            
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            
+            requestAnimationFrame(render);
+        }
+
+        // Mouse interaction
+        let isDragging = false;
+        let lastX, lastY;
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastX = e.clientX;
+            lastY = e.clientY;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - lastX;
+            const dy = e.clientY - lastY;
+            rotationY += dx * 0.01;
+            rotationX += dy * 0.01;
+            rotationX = Math.max(-Math.PI/2, Math.min(Math.PI/2, rotationX));
+            lastX = e.clientX;
+            lastY = e.clientY;
+        });
+
+        canvas.addEventListener('mouseup', () => isDragging = false);
+        canvas.addEventListener('mouseleave', () => isDragging = false);
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            zoom *= e.deltaY > 0 ? 1.1 : 0.9;
+            zoom = Math.max(0.5, Math.min(10, zoom));
+        });
+
+        // UI Controls
+        document.getElementById('brightness').addEventListener('input', (e) => {
+            brightness = parseFloat(e.target.value);
+            document.getElementById('brightnessVal').textContent = brightness.toFixed(1);
+        });
+
+        document.getElementById('threshold').addEventListener('input', (e) => {
+            threshold = parseFloat(e.target.value);
+            document.getElementById('thresholdVal').textContent = threshold.toFixed(2);
+        });
+
+        document.getElementById('steps').addEventListener('input', (e) => {
+            numSteps = parseInt(e.target.value);
+            document.getElementById('stepsVal').textContent = numSteps;
+        });
+
+        document.getElementById('mipBtn').addEventListener('click', () => {
+            renderMode = 0;
+            document.querySelectorAll('#controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById('mipBtn').classList.add('active');
+            document.getElementById('rotateBtn').classList.toggle('active', autoRotate);
+        });
+
+        document.getElementById('alphaBtn').addEventListener('click', () => {
+            renderMode = 1;
+            document.querySelectorAll('#controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById('alphaBtn').classList.add('active');
+            document.getElementById('rotateBtn').classList.toggle('active', autoRotate);
+        });
+
+        document.getElementById('isoBtn').addEventListener('click', () => {
+            renderMode = 2;
+            document.querySelectorAll('#controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById('isoBtn').classList.add('active');
+            document.getElementById('rotateBtn').classList.toggle('active', autoRotate);
+        });
+
+        document.getElementById('rotateBtn').addEventListener('click', (e) => {
+            autoRotate = !autoRotate;
+            e.target.classList.toggle('active', autoRotate);
+        });
+
+        // Initialize
+        async function main() {
+            init();
+            await loadVolume();
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('info').style.display = 'block';
+            document.getElementById('controls').style.display = 'block';
+            render();
+        }
+
+        main();
+    </script>
+</body>
+</html>

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import sys
 
 from gs_utils.Compute_intensity import compute_intensity
+from swc_utils import create_gaussian_params_from_swc
 
 
 class GaussianModel:
@@ -43,6 +44,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        # For gradient accumulation during densification
+        self.xyz_gradient_accum = None
+        self.denom = None
 
     def capture(self):
         return (
@@ -154,6 +158,57 @@ class GaussianModel:
         self._scaling = nn.Parameter(scaling.requires_grad_(True))
         self._rotation = nn.Parameter(rotation.requires_grad_(True))
     
+    def create_from_swc(self, swc_path, volume_size, num_samples=150000, 
+                        ini_intensity=0.1, spatial_lr_scale=1,
+                        densify=True, points_per_unit=5.0,
+                        radius_based_density=True):
+        """
+        Initialize Gaussian positions from SWC skeleton file.
+        
+        This method places Gaussians ONLY along the neuron structure defined by the
+        SWC skeleton, avoiding void regions. It uses:
+        - Skeleton geometry for position initialization
+        - Local radius for density allocation (thicker regions get more Gaussians)
+        - Radius-based scaling for Gaussian size
+        
+        Benefits over FBP-based initialization:
+        - Avoids wasting Gaussians on empty space
+        - Better coverage of actual neuron structure
+        - More efficient for sparse structures like neurons
+        
+        Args:
+            swc_path: Path to the SWC skeleton file
+            volume_size: (D, H, W) target volume dimensions
+            num_samples: Number of Gaussians to create
+            ini_intensity: Initial intensity value for Gaussians
+            spatial_lr_scale: Learning rate scale factor
+            densify: Whether to interpolate skeleton points
+            points_per_unit: Density of interpolation along skeleton
+            radius_based_density: Allocate more Gaussians to thicker regions
+        """
+        self.spatial_lr_scale = spatial_lr_scale
+        
+        # Create Gaussian parameters from SWC skeleton
+        params = create_gaussian_params_from_swc(
+            swc_path=swc_path,
+            num_gaussians=num_samples,
+            volume_size=volume_size,
+            ini_intensity=ini_intensity,
+            densify=densify,
+            points_per_unit=points_per_unit,
+            radius_based_density=radius_based_density,
+            device="cuda"
+        )
+        
+        self._xyz = nn.Parameter(params['xyz'].requires_grad_(True))
+        self._intensity = nn.Parameter(params['intensity'].requires_grad_(True))
+        self._scaling = nn.Parameter(params['scaling'].requires_grad_(True))
+        self._rotation = nn.Parameter(params['rotation'].requires_grad_(True))
+        
+        print(f"Initialized {num_samples} Gaussians from SWC skeleton: {swc_path}")
+        print(f"  Position range: [{self._xyz.min().item():.4f}, {self._xyz.max().item():.4f}]")
+        print(f"  Scale range: [{self.get_scaling.min().item():.4f}, {self.get_scaling.max().item():.4f}]")
+    
     
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -231,6 +286,35 @@ class GaussianModel:
         self._intensity = optimizable_tensors["intensity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        
+        # Also prune gradient accumulators if they exist
+        if self.xyz_gradient_accum is not None:
+            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        if self.denom is not None:
+            self.denom = self.denom[valid_points_mask]
+
+    def add_densification_stats(self):
+        """Accumulate xyz gradients for densification decisions.
+        Call this after loss.backward() but before optimizer.step().
+        """
+        if self._xyz.grad is None:
+            return
+        
+        # Initialize accumulators if needed
+        if self.xyz_gradient_accum is None:
+            self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        if self.denom is None:
+            self.denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        
+        # Accumulate gradient norms
+        grad_norm = torch.norm(self._xyz.grad, dim=-1, keepdim=True)
+        self.xyz_gradient_accum += grad_norm
+        self.denom += 1
+
+    def reset_densification_stats(self):
+        """Reset gradient accumulators after densification."""
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
 
 
 
@@ -267,6 +351,19 @@ class GaussianModel:
         self._intensity = optimizable_tensors["intensity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        
+        # Extend gradient accumulators for new points
+        num_new = new_xyz.shape[0]
+        if self.xyz_gradient_accum is not None:
+            self.xyz_gradient_accum = torch.cat([
+                self.xyz_gradient_accum,
+                torch.zeros((num_new, 1), device="cuda")
+            ], dim=0)
+        if self.denom is not None:
+            self.denom = torch.cat([
+                self.denom,
+                torch.zeros((num_new, 1), device="cuda")
+            ], dim=0)
 
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -310,16 +407,29 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_intensity, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_intensity, sigma_extent):
-        grads = torch.norm(self._xyz.grad, dim=-1, keepdim=True)
+    def densify_and_prune(self, max_grad, min_intensity, sigma_extent, max_scale=None):
+        # Use accumulated gradients instead of current gradients
+        if self.xyz_gradient_accum is None or self.denom is None:
+            print("Warning: No accumulated gradients for densification, skipping...")
+            return
+        
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, sigma_extent)
         self.densify_and_split(grads, max_grad, sigma_extent)
     
+        # Prune by intensity and minimum scale
         prune_mask = (
                     (self.get_intensity < min_intensity).squeeze() 
                     | (torch.min(self.get_scaling, dim=1).values < 0.003)
                 )
+        
+        # Prune by maximum scale (prevents huge blob Gaussians)
+        if max_scale is not None:
+            too_large = (torch.max(self.get_scaling, dim=1).values > max_scale)
+            prune_mask = prune_mask | too_large
+            print(f"  - Too large (scale > {max_scale}): {too_large.sum().item()}")
         
         print("Pruning {} points".format(prune_mask.sum()))
         self.prune_points(prune_mask)

@@ -2,11 +2,14 @@ import torch
 from torch.autograd import Function
 import torch.utils.cpp_extension
 from torch.utils.cpp_extension import load
+import os
 
+# Get the directory where this script is located
+_current_dir = os.path.dirname(os.path.abspath(__file__))
 
 compute_intensity_cuda = load(
     name='compute_intensity_cuda', 
-    sources=['/data/yingtaili/3DGR-CT-archive/gs_utils/discretize_grid.cu'],
+    sources=[os.path.join(_current_dir, 'discretize_grid.cu')],
     extra_cflags=['-O3'],
     extra_cuda_cflags=['-O3']
 )
