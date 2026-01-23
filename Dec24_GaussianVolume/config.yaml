@@ -1,0 +1,43 @@
+# Default configuration for Gaussian-Based Volume Data Representation
+# Implementation based on [21 Dec. 24] Algorithm from research proposal
+
+# Volume data
+volume: null  # Path to volume (TIFF or NPY) - set via command line
+
+# Model parameters
+model:
+  num_gaussians: 5000      # N: Number of Gaussian basis functions
+  init_method: uniform      # Initialization: 'uniform' or 'grid'
+
+# Training parameters (Steps 4-5)
+training:
+  epochs: 1000               # Number of training epochs
+  batch_size: 4096          # Batch size for voxel sampling (Step 5.1)
+  learning_rate: 0.01       # Learning rate ρ (Step 5.5)
+  optimizer: adam           # Optimizer: 'adam' or 'sgd' (Step 4.1)
+  eval_interval: 10         # Evaluation interval
+  save_interval: 50         # Checkpoint save interval
+
+# Regularization (Step 6)
+regularization:
+  # 6.1 Weight Sparsity: L_sparsity = λ_w * Σ|w_i|
+  lambda_sparsity: 0.001    # λ_w
+  use_sparsity: true
+  
+  # 6.2 Overlap: L_overlap = λ_o * Σ overlap(G_i, G_j)
+  lambda_overlap: 0.001     # λ_o
+  use_overlap: true
+  
+  # 6.3 Smoothness: L_smoothness = λ_s * Σ||∇_u G_i||^2
+  lambda_smoothness: 0.001  # λ_s
+  use_smoothness: true
+
+# Output
+output:
+  dir: output               # Output directory
+  save_reconstructed: true  # Save reconstructed volume
+  save_parameters: true     # Save Gaussian parameters
+  save_plots: true          # Save training plots
+
+# Device
+device: cuda                # 'cuda' or 'cpu'
